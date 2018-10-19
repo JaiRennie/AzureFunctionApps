@@ -1,0 +1,150 @@
+#r "System.Configuration"
+#r "System.Data"
+#r "Microsoft.ServiceBus"
+#r "Newtonsoft.Json"
+
+using System;
+using System.Text;
+using System.Configuration;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Microsoft.ServiceBus.Messaging;
+using System.Data.SqlClient;
+using Newtonsoft.Json;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+
+
+//Main method
+public static async Task Run(EventData myIoTHubMessage, TraceWriter log)
+{
+    //Connection String to Azure SQL
+    var connstring = ConfigurationManager.ConnectionStrings["weatherSQLconn"].ConnectionString;
+
+    //Get IoT message from IoTHub and Deserialise
+    var iotmessage = Encoding.UTF8.GetString(myIoTHubMessage.GetBytes());
+    var temperaturealert = myIoTHubMessage.Properties["temperatureAlert"].ToString();
+    TempSensor ts = JsonConvert.DeserializeObject<TempSensor>(iotmessage);
+
+    //Get Current Time
+    var messagetime = DateTime.Now;
+
+    //Assign Rain and RainProbability Variables
+    string result = "";
+    float RainProbability = 0;
+    string Rain = "";
+
+    //Connect to Azure Learning studios WebService via API
+    using (var client = new HttpClient())
+    {
+        var scoreRequest = new
+        {
+            //Assigns Device Message Temperature and Humidity to ML inputs
+            Inputs = new Dictionary<string, MlValues>()
+            {
+                {
+                    "input1", new MlValues()
+                    {
+                            ColumnNames = new string[] {"temperature", "humidity"},
+                            Values = new string[,] {  { $"{ts.Temperature}", $"{ts.Humidity}" },  }
+                    }
+                },
+            },
+            GlobalParameters = new Dictionary<string, string>()
+            {
+            }
+        };
+
+        //API Connection to Azure ML Studio
+        const string apiKey = "hUBMuEbaFCBEFS0r32RfNSTk6ozObGkJAGMyZB6+zFgRomf/I53/P9g9RGCDMw0lXdng3v/33k8MYTEoSDWQqw==";
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+        client.BaseAddress = new Uri("https://ussouthcentral.services.azureml.net/workspaces/5a525d0c6dfe48ac9992fd3b422126bd/services/a8975d553a05413eb8c211620924a020/execute?api-version=2.0&details=true");
+
+        HttpResponseMessage response = await client.PostAsJsonAsync("", scoreRequest);
+
+        //recieve result
+        result = await response.Content.ReadAsStringAsync();
+    }
+
+    //Deserialize result from API into MlValues JSON Object 
+    RootObject RootObj = JsonConvert.DeserializeObject<RootObject>(result);
+
+    List<List<string>> mlValues = RootObj.Results.output1.value.Values;
+
+    //Assign results into Rain and 
+    RainProbability = float.Parse(mlValues[0][3]);
+    Rain = mlValues[0][2];
+
+    //Log testing
+    log.Info(RainProbability.ToString());
+    log.Info(Rain);
+
+    //Connection to Azure SQL
+    using (SqlConnection conn = new SqlConnection(connstring))
+    {
+       var query = $"EXEC poptemptables @MessageId = '{ts.MessageId}', @DeviceId = '{ts.DeviceId}', @Placement = '{ts.Placement}', @SensorType = '{ts.SensorType}', @Location = '{ts.Location}', @Country = '{ts.Country}', @Latitude = '{ts.Latitude}', @Longitude = '{ts.Longitude}', @Temperature = '{ts.Temperature}', @Humidity = '{ts.Humidity}', @temperatureAlert = '{temperaturealert}', @Messagetime = '{messagetime}', @RainProbability = '{RainProbability}', @Rain = '{Rain}'";
+
+       conn.Open();
+       using (SqlCommand cmd = new SqlCommand(query, conn))
+       {
+           try
+           {
+           var device = await cmd.ExecuteNonQueryAsync();
+           log.Info($"{device} device har skapats");
+           }
+           catch
+           {
+           log.Info($"Det gick inte att skapa en device");
+           }
+       }
+   }
+}
+
+//Getters and Setters for JSON Objects
+//Device Message Object
+public class TempSensor
+{
+    public int MessageId { get; set; }
+    public string DeviceId { get; set; }
+    public string Placement { get; set; }
+    public string SensorType { get; set; }
+    public string Location { get; set; }
+    public string Country { get; set; }
+    public float Latitude { get; set; }
+    public float Longitude { get; set; }
+    public int Temperature { get; set; }
+    public int Humidity { get; set; }
+}
+
+//MachineLearning inputs
+public class MlValues
+{
+    public string[] ColumnNames { get; set; }
+    public string[,] Values { get; set; }
+}
+
+//MachineLearning outputs
+public class Value
+{
+    public List<string> ColumnNames { get; set; }
+    public List<string> ColumnTypes { get; set; }
+    public List<List<string>> Values { get; set; }
+}
+
+public class Output1
+{
+    public string type { get; set; }
+    public Value value { get; set; }
+}
+
+public class Results
+{
+    public Output1 output1 { get; set; }
+}
+
+public class RootObject
+{
+    public Results Results { get; set; }
+}
